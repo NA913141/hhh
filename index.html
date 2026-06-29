@@ -16,6 +16,7 @@
   window.FIREBASE_CONFIG = { apiKey:"", authDomain:"", projectId:"", storageBucket:"", messagingSenderId:"", appId:"" };
 </script>
  
+<script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.2.0"></script>
 <style>
   :root{
     --bg:#F5F2E8;
@@ -214,6 +215,8 @@
     border:1px solid var(--cold);background:#fff;color:var(--cold-deep);border-radius:14px;
     padding:5px 10px;font-size:11.5px;cursor:pointer;font-weight:700;
   }
+  .qd-btn.unit-btn{border-color:var(--ink-soft);color:var(--ink-soft);}
+  .qd-btn.unit-btn.selected{background:var(--ink);color:#fff;border-color:var(--ink);}
   .primary-btn{
     width:100%;background:var(--ink);color:#fff;border:none;border-radius:12px;
     padding:13px;font-size:15px;font-weight:800;cursor:pointer;margin-top:6px;
@@ -350,9 +353,7 @@
  
 <div id="loading-screen">🧊 載入中…</div>
 <div id="app"></div>
-<div id="qr-reader-temp" style="display:none;"></div>
  
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
 <script>
 /* =========================================================
    家冰箱 App — 全部邏輯
@@ -375,6 +376,7 @@ const CATEGORIES = [
   {id:'other',   name:'其他',     icon:'📦', shelfDays:14},
 ];
 const DEFAULT_LOCATIONS = ['冷凍庫上層','冷凍庫下層','冷藏室上層','冷藏室中層','冷藏室下層','蔬果保鮮室','門邊儲物格'];
+const QUICK_UNITS = ['個','包','瓶','罐','盒','袋','條','顆','片','份','公克','公斤','毫升','公升'];
  
 const STATUS_LABEL = {
   expired:{label:'已過期', color:'var(--expired)', dot:'#7A2E2E'},
@@ -460,8 +462,8 @@ function toast(msg, ms=2200){
  
 /* ---------- Storage 後端判斷 ----------
    claude   ：在 Claude 對話視窗內預覽時，使用 Claude 提供的 window.storage（僅供測試，僅這個分頁能看到）
-   firebase ：部署成獨立網站後，若已填寫 FIREBASE_CONFIG，使用 Firebase Firestore，全家可即時跨裝置同步
-   local    ：部署成獨立網站但尚未設定 Firebase，資料只存在這支裝置的瀏覽器（localStorage），不會跨裝置共享
+   cloudflare：部署成獨立網站後，若已填寫 CF_WORKER_URL，使用 Cloudflare Worker + KV，全家可跨裝置同步
+   local    ：部署成獨立網站但尚未設定後端，資料只存在這支裝置的瀏覽器（localStorage），不會跨裝置共享
 ---------------------------------------------- */
 const IN_CLAUDE_ARTIFACT = (typeof window.storage !== 'undefined');
  
@@ -711,9 +713,13 @@ async function saveShoplist(){
 async function refreshItemsFromServer(){
   if(SHARED_BACKEND==='cloudflare'){
     const rec = await cfRead(STATE.code);
-    if(rec && Array.isArray(rec.items)) STATE.items = rec.items;
-    if(rec && Array.isArray(rec.shoplist)) STATE.shoplist = rec.shoplist;
-    if(!rec) toast('⚠️ 無法取得最新資料，以目前畫面為準');
+    if(!rec){ toast('⚠️ 無法取得最新資料，以目前畫面為準'); return; }
+    if(Array.isArray(rec.items)) STATE.items = rec.items;
+    if(Array.isArray(rec.shoplist)) STATE.shoplist = rec.shoplist;
+    if(rec.config){
+      if(rec.config.locations && rec.config.locations.length) STATE.locations = rec.config.locations;
+      if(rec.config.customCategories) STATE.customCategories = rec.config.customCategories;
+    }
     return;
   }
   // claude / local: no-op or localStorage
@@ -1116,6 +1122,9 @@ function openEditSheet(draft, onSaved){
         <div class="field">
           <label>單位</label>
           <input type="text" id="f-unit" value="${escapeHtml(draft.unit)}" placeholder="個／包／g">
+          <div class="quickdates" id="f-unit-quick">
+            ${QUICK_UNITS.map(u=>`<span class="qd-btn unit-btn ${u===draft.unit?'selected':''}" data-unit="${escapeHtml(u)}">${escapeHtml(u)}</span>`).join('')}
+          </div>
         </div>
       </div>
       <div class="field">
@@ -1143,8 +1152,21 @@ function openEditSheet(draft, onSaved){
   document.body.appendChild(overlay);
   overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
   document.getElementById('btn-cancel-edit').onclick=()=>overlay.remove();
-  overlay.querySelectorAll('.qd-btn').forEach(b=>{
+  overlay.querySelectorAll('.qd-btn[data-days]').forEach(b=>{
     b.onclick=()=>{ document.getElementById('f-expiry').value = addDaysStr(parseInt(b.dataset.days,10)); };
+  });
+  const unitInput = document.getElementById('f-unit');
+  overlay.querySelectorAll('#f-unit-quick .unit-btn').forEach(b=>{
+    b.onclick=()=>{
+      unitInput.value = b.dataset.unit;
+      overlay.querySelectorAll('#f-unit-quick .unit-btn').forEach(x=>x.classList.remove('selected'));
+      b.classList.add('selected');
+    };
+  });
+  unitInput.addEventListener('input', ()=>{
+    overlay.querySelectorAll('#f-unit-quick .unit-btn').forEach(x=>{
+      x.classList.toggle('selected', x.dataset.unit===unitInput.value);
+    });
   });
   if(!draft.isNew){
     document.getElementById('btn-delete-item').onclick=async ()=>{
@@ -1228,6 +1250,25 @@ function openPhotoCapture(mode, onFileReady){
   };
 }
  
+/* ── 條碼掃描核心：使用 ZXing-js（@zxing/browser），開源、支援 EAN-13/UPC/Code128/QR 等所有常見格式 ── */
+let _zxingReader = null;
+function getZxingReader(){
+  if(!_zxingReader && window.ZXingBrowser){
+    _zxingReader = new ZXingBrowser.BrowserMultiFormatReader();
+  }
+  return _zxingReader;
+}
+async function decodeBarcodeFromDataUrl(dataUrl){
+  const reader = getZxingReader();
+  if(!reader) return null;
+  try{
+    const result = await reader.decodeFromImageUrl(dataUrl);
+    return result ? result.getText() : null;
+  }catch(e){
+    return null; // NotFoundException 等於沒找到，視為正常情況
+  }
+}
+ 
 function openLiveCameraSheet(mode, onFileReady){
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
@@ -1235,91 +1276,109 @@ function openLiveCameraSheet(mode, onFileReady){
     <div class="sheet" style="padding-bottom:20px;">
       <div class="sheet-handle"></div>
       <h2>${mode==='barcode'?'🏷️ 掃描條碼':'📷 拍照辨識'}</h2>
-      <div style="position:relative;background:#000;border-radius:12px;overflow:hidden;margin-bottom:12px;">
-        <video id="cam-video" autoplay playsinline muted style="width:100%;max-height:300px;display:block;object-fit:cover;"></video>
-        ${mode==='barcode'?'<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;"><div style="width:65%;height:38%;border:3px solid rgba(255,230,50,0.9);border-radius:10px;box-shadow:0 0 0 2000px rgba(0,0,0,0.35);"></div></div>':''}
+      <div style="position:relative;background:#000;border-radius:12px;overflow:hidden;margin-bottom:12px;max-height:300px;">
+        <video id="cam-video" autoplay playsinline muted style="width:100%;display:block;object-fit:cover;"></video>
+        ${mode==='barcode'?`<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;">
+          <div style="width:70%;aspect-ratio:2;border:3px solid #FFE800;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,0.45);"></div>
+        </div>`:''}
       </div>
       <canvas id="cam-canvas" style="display:none;"></canvas>
-      <div id="cam-status" class="ai-banner" style="margin-bottom:10px;">📹 啟動攝像頭中…</div>
+      <div id="cam-status" class="ai-banner" style="margin-bottom:10px;font-size:12px;">📹 啟動攝像頭中…</div>
       <div style="display:flex;gap:8px;">
         <button class="primary-btn" id="cam-snap" style="flex:1;">📸 ${mode==='barcode'?'手動拍攝':'拍攝辨識'}</button>
-        <button class="secondary-btn" id="cam-close" style="flex:0 0 80px;">關閉</button>
+        <button class="secondary-btn" id="cam-close" style="flex:0 0 72px;">關閉</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
  
   let stream = null;
-  let scanInterval = null;
+  let zxingControls = null;
+  let scanning = true;
  
-  const video = document.getElementById('cam-video');
-  const canvas = document.getElementById('cam-canvas');
-  const status = document.getElementById('cam-status');
+  const video = overlay.querySelector('#cam-video');
+  const canvas = overlay.querySelector('#cam-canvas');
+  const status = overlay.querySelector('#cam-status');
+ 
+  function stopCamera(){
+    scanning = false;
+    if(zxingControls){ try{ zxingControls.stop(); }catch(e){} zxingControls=null; }
+    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  }
+ 
+  function getFrame(){
+    if(!video.videoWidth) return null;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0);
+    return ctx;
+  }
+ 
+  function snapToFile(cb){
+    getFrame();
+    canvas.toBlob(blob=>{ cb(new File([blob], 'capture.jpg', {type:'image/jpeg'})); }, 'image/jpeg', 0.92);
+  }
  
   async function startCamera(){
     try{
       stream = await navigator.mediaDevices.getUserMedia({
-        video:{ facingMode:{ideal:'environment'}, width:{ideal:1280} }
+        video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} }
       });
       video.srcObject = stream;
-      await new Promise(res=>{ video.onloadedmetadata=res; });
-      status.innerHTML = mode==='barcode' ? '📷 對準條碼，自動偵測中…' : '📷 攝像頭已開啟，按拍攝辨識';
+      await new Promise(res=>{ video.onloadedmetadata=()=>{ video.play(); res(); }; });
+      status.innerHTML = mode==='barcode'
+        ? '🎯 對準條碼，自動偵測中…（黃框內）'
+        : '📷 攝像頭已開啟，按「拍攝辨識」';
     }catch(e){
-      status.innerHTML = '⚠️ 無法開啟攝像頭：'+e.message+'<br><small>請改用上方「選擇圖片」</small>';
-      document.getElementById('cam-snap').disabled = true;
+      status.innerHTML = `⚠️ 攝像頭開啟失敗：${e.message}<br><small>請改用「選擇圖片」或在 Chrome 地址列允許攝像頭</small>`;
+      overlay.querySelector('#cam-snap').disabled = true;
+      return;
     }
+    if(mode==='barcode') startZxingAutoScan();
   }
  
-  function stopCamera(){
-    if(scanInterval){ clearInterval(scanInterval); scanInterval=null; }
-    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  function startZxingAutoScan(){
+    const reader = getZxingReader();
+    if(!reader){
+      status.innerHTML = '⚠️ 條碼引擎尚未載入，請改用「選擇圖片」';
+      return;
+    }
+    reader.decodeFromStream(stream, video, (result, err, controls)=>{
+      zxingControls = controls;
+      if(result && scanning){
+        scanning = false;
+        const code = result.getText();
+        status.innerHTML = `✅ 找到條碼：${escapeHtml(code)}`;
+        setTimeout(()=>{
+          snapToFile(f=>{
+            stopCamera(); overlay.remove();
+            if(onFileReady) onFileReady(f, code);
+            else handleBarcodeFileWithCode(f, code);
+          });
+        }, 300);
+      }
+      // err 在沒掃到時會持續觸發(NotFoundException)，是正常現象，忽略即可
+    }).catch(e=>{
+      console.error('zxing decodeFromStream failed', e);
+      status.innerHTML = '⚠️ 自動掃描啟動失敗，請用「手動拍攝」改走拍照比對流程';
+    });
   }
  
-  async function captureBlob(){
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    canvas.getContext('2d').drawImage(video, 0, 0);
-    return new Promise(res=> canvas.toBlob(res, 'image/jpeg', 0.92));
-  }
- 
-  document.getElementById('cam-close').onclick = ()=>{ stopCamera(); overlay.remove(); };
+  overlay.querySelector('#cam-close').onclick = ()=>{ stopCamera(); overlay.remove(); };
   overlay.addEventListener('click', e=>{ if(e.target===overlay){ stopCamera(); overlay.remove(); } });
  
-  document.getElementById('cam-snap').onclick = async ()=>{
-    document.getElementById('cam-snap').disabled = true;
+  overlay.querySelector('#cam-snap').onclick = ()=>{
+    overlay.querySelector('#cam-snap').disabled = true;
     status.innerHTML = '<div class="spinner" style="display:inline-block;margin-right:6px;vertical-align:middle;"></div>處理中…';
-    const blob = await captureBlob();
-    const file = new File([blob], 'capture.jpg', {type:'image/jpeg'});
-    stopCamera(); overlay.remove();
-    if(onFileReady) onFileReady(file);
-    else if(mode==='barcode') handleBarcodeFile(file);
-    else handlePhotoFile(file);
+    snapToFile(file=>{
+      stopCamera(); overlay.remove();
+      if(onFileReady) onFileReady(file);
+      else if(mode==='barcode') handleBarcodeFile(file);
+      else handlePhotoFile(file);
+    });
   };
  
-  if(mode==='barcode'){
-    startCamera().then(()=>{
-      scanInterval = setInterval(async ()=>{
-        if(!stream || !video.videoWidth) return;
-        const blob = await captureBlob();
-        const file = new File([blob], 'scan.jpg', {type:'image/jpeg'});
-        try{
-          const reader = new Html5Qrcode('qr-reader-temp');
-          const code = await reader.scanFile(file, false).catch(()=>null);
-          if(code){
-            clearInterval(scanInterval); scanInterval=null;
-            status.innerHTML = '✅ 找到條碼：'+escapeHtml(code);
-            setTimeout(()=>{
-              stopCamera(); overlay.remove();
-              const f2 = new File([blob],'barcode.jpg',{type:'image/jpeg'});
-              if(onFileReady) onFileReady(f2, code);
-              else handleBarcodeFileWithCode(f2, code);
-            }, 500);
-          }
-        }catch(e){}
-      }, 900);
-    });
-  } else {
-    startCamera();
-  }
+  startCamera();
 }
  
 function fileToDataUrl(file){
@@ -1371,16 +1430,10 @@ async function handleBarcodeFileWithCode(file, code, onDraftReady){
 async function handleBarcodeFile(file, onDraftReady){
   const dataUrl = await fileToDataUrl(file);
   const overlay = openProcessingSheet('🏷️ 辨識條碼中', dataUrl);
-  let code=null;
-  try{
-    const reader = new Html5Qrcode('qr-reader-temp');
-    try{ const r=await reader.scanFileV2(file,false); code=r&&r.decodedText; }catch(e1){
-      try{ code=await reader.scanFile(file,false); }catch(e2){ code=null; }
-    }
-  }catch(e){ code=null; }
+  const code = await decodeBarcodeFromDataUrl(dataUrl);
   if(!code){
     overlay.remove();
-    toast('找不到條碼，改用手動輸入或拍照辨識');
+    toast('找不到條碼，請確認圖片清晰、對準條碼，或改用手動輸入');
     if(onDraftReady) onDraftReady(null);
     else openEditSheet(blankDraft('manual'));
     return;
@@ -1532,6 +1585,9 @@ function openAddToFridgeSheet(shopItem){
         <div class="field">
           <label>單位</label>
           <input type="text" id="ftf-unit" value="個" placeholder="個／包／g">
+          <div class="quickdates" id="ftf-unit-quick">
+            ${QUICK_UNITS.map(u=>`<span class="qd-btn unit-btn ${u==='個'?'selected':''}" data-unit="${escapeHtml(u)}">${escapeHtml(u)}</span>`).join('')}
+          </div>
         </div>
       </div>
       <div class="field">
@@ -1550,8 +1606,21 @@ function openAddToFridgeSheet(shopItem){
   document.body.appendChild(overlay);
   overlay.querySelector('#ftf-cancel').onclick = () => overlay.remove();
   overlay.addEventListener('click', e => { if(e.target===overlay) overlay.remove(); });
-  overlay.querySelectorAll('.qd-btn').forEach(b => {
+  overlay.querySelectorAll('.qd-btn[data-days]').forEach(b => {
     b.onclick = () => { document.getElementById('ftf-expiry').value = addDaysStr(parseInt(b.dataset.days,10)); };
+  });
+  const ftfUnitInput = document.getElementById('ftf-unit');
+  overlay.querySelectorAll('#ftf-unit-quick .unit-btn').forEach(b=>{
+    b.onclick=()=>{
+      ftfUnitInput.value = b.dataset.unit;
+      overlay.querySelectorAll('#ftf-unit-quick .unit-btn').forEach(x=>x.classList.remove('selected'));
+      b.classList.add('selected');
+    };
+  });
+  ftfUnitInput.addEventListener('input', ()=>{
+    overlay.querySelectorAll('#ftf-unit-quick .unit-btn').forEach(x=>{
+      x.classList.toggle('selected', x.dataset.unit===ftfUnitInput.value);
+    });
   });
   overlay.querySelector('#ftf-confirm').onclick = async () => {
     const loc = document.getElementById('ftf-loc').value;
@@ -1821,8 +1890,9 @@ function wireSettingsEvents(){
     document.querySelectorAll('[data-loc-idx]').forEach(inp=>{
       STATE.locations[parseInt(inp.dataset.locIdx,10)] = inp.value.trim();
     });
+    STATE.locations = STATE.locations.filter(l=>l.trim());
     await saveConfig();
-    toast('分層設定已儲存');
+    toast('✅ 分層設定已儲存並同步給全家');
     render();
   };
   document.querySelectorAll('[data-del-cat]').forEach(b=>{
@@ -1845,7 +1915,7 @@ function wireSettingsEvents(){
       STATE.customCategories[parseInt(inp.dataset.catIdx,10)].name = inp.value.trim();
     });
     await saveConfig();
-    toast('分類設定已儲存');
+    toast('✅ 分類設定已儲存並同步給全家');
     render();
   };
   document.getElementById('btn-clear-data').onclick=async ()=>{
@@ -1895,7 +1965,11 @@ function renderOnboarding(prefillCode, prefillName){
     mode='join';
     document.getElementById('seg-join').classList.add('active');
     document.getElementById('seg-create').classList.remove('active');
+    const codeInput=document.getElementById('ob-code');
+    codeInput.value='';
+    codeInput.placeholder='輸入家人給你的代碼';
     codeField.style.display='block';
+    codeInput.focus();
   };
   document.getElementById('ob-start').onclick=async ()=>{
     const name=document.getElementById('ob-name').value.trim();
@@ -1925,7 +1999,6 @@ async function boot(){
     renderOnboarding(profile&&profile.code, profile&&profile.name);
   }
 }
-
  
 boot();
  
